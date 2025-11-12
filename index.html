@@ -1,0 +1,254 @@
+<!--
+AR Clothing Prototype — Single-file HTML prototype
+- Purpose: cost-efficient proof-of-concept that scans a code on clothing, toggles between two modes based on device orientation:
+  1) Landscape (try-on AR mode): shows live camera + a simple overlay of the scanned clothing item to simulate "trying it on".
+  2) Portrait (info mode): shows metadata about the scanned item (brand, size, care, recommendations).
+- How it works (MVP):
+  * Use smartphone browser (supports getUserMedia).
+  * Detect orientation using the Screen Orientation API and DeviceOrientation events.
+  * Scan QR codes printed on clothes using jsQR from a video frame.
+  * Maintain a small local JSON DB mapping QR payload -> metadata & overlay image.
+  * In AR try-on mode we overlay a 2D garment PNG on the camera feed and let the user manually position/scale it. (Simple but fast; upgrade path uses body pose / segmentation)
+
+Hardware (minimum):
+  * Any modern smartphone (dev/test device)
+  * Printed QR labels (stickers) to attach to garments
+  * Optional: inexpensive clear acrylic or prism + 3D-printed frame for a more "see-through" AR look
+
+Estimated costs (student budget friendly):
+  * QR stickers: <$5
+  * Hosting (optional): free with GitHub Pages
+  * Optional small parts (3D-print, acrylic, NFC tags): $10â$50
+
+Software stack used in this single-file prototype:
+  * HTML/CSS/Vanilla JS
+  * jsQR (QR scanner) via CDN
+  * Optional upgrade: TensorFlow.js BodyPix or MediaPipe for segmentation and MoveNet for pose
+
+INSTRUCTIONS: Serve this file over HTTPS or open via localhost (some phones require https for camera). If testing locally, use a simple server: `python -m http.server` and open the phone to the computer's IP.
+-->
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0" />
+  <title>AR Clothing Prototype — Demo</title>
+  <style>
+    :root{--bg:#0b0b0b;--panel:#111;--accent:#ffd166}
+    html,body{height:100%;margin:0;font-family:system-ui,Segoe UI,Roboto,Arial}
+    .app{height:100%;display:flex;flex-direction:column;background:var(--bg);color:#eee}
+    #view{position:relative;flex:1;display:flex;align-items:center;justify-content:center;overflow:hidden}
+    video#camera{width:100%;height:100%;object-fit:cover;transform:scaleX(-1);} /* mirror for front camera */
+    canvas#videoCanvas{display:none}
+
+    /* overlay image shown in try-on mode */
+    img#overlay{position:absolute;left:50%;top:40%;transform:translate(-50%,-50%);max-width:70%;opacity:0.95;pointer-events:none}
+
+    /* UI panels */
+    .topbar{display:flex;gap:8px;padding:8px;background:linear-gradient(180deg,rgba(0,0,0,0.4),transparent);position:absolute;top:0;left:0;right:0;z-index:20}
+    button{background:#222;border:1px solid #333;color:#fff;padding:8px 10px;border-radius:6px}
+    .infoPanel{position:absolute;right:8px;bottom:8px;background:var(--panel);padding:12px;border-radius:10px;max-width:46%;z-index:20}
+    .hint{position:absolute;left:8px;bottom:8px;background:rgba(0,0,0,0.45);padding:8px;border-radius:8px;font-size:12px}
+
+    /* mode badge */
+    .modeBadge{position:absolute;left:50%;top:10px;transform:translateX(-50%);background:#111;padding:6px 12px;border-radius:999px;border:1px solid #222;z-index:20}
+
+    /* portrait-only info screen */
+    .portraitInfo{display:none;padding:12px}
+    @media (orientation: portrait) {
+      /* show portrait info as a full-screen panel when in portrait and not camera overlay */
+      .portraitInfo{display:block;background:var(--panel);height:100%;overflow:auto}
+      #view{display:none}
+    }
+
+    /* simple responsive footer */
+    footer{padding:8px;text-align:center;font-size:12px;background:linear-gradient(0deg,rgba(0,0,0,0.5),transparent)}
+
+    /* small helpers */
+    .metaLabel{color:#ccc;font-size:13px}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div id="view">
+      <video id="camera" autoplay playsinline></video>
+      <canvas id="videoCanvas"></canvas>
+      <img id="overlay" src="" alt="overlay" style="display:none" />
+
+      <div class="topbar">
+        <button id="scanBtn">Scan QR</button>
+        <button id="toggleMirror">Toggle Mirror</button>
+        <div style="flex:1"></div>
+        <div id="status">No item scanned</div>
+      </div>
+
+      <div class="modeBadge" id="modeBadge">Mode: <span id="modeText">AR try-on</span></div>
+
+      <div class="infoPanel" id="infoPanel" style="display:none">
+        <div><strong id="itemTitle"></strong></div>
+        <div class="metaLabel" id="itemMeta"></div>
+        <div style="margin-top:8px;">Recommendations:</div>
+        <div id="recs"></div>
+      </div>
+
+      <div class="hint">Tip: Hold horizontally for try-on, vertically for item info</div>
+    </div>
+
+    <div class="portraitInfo" id="portraitInfo" style="display:none">
+      <h2 id="pTitle">No item scanned</h2>
+      <p id="pMeta">Scan an item's QR code while in landscape to load metadata, then rotate to portrait to inspect details.</p>
+      <div id="pRecs"></div>
+    </div>
+
+    <footer>Prototype — student build. Serve via HTTPS for camera access.</footer>
+  </div>
+
+  <!-- jsQR (for QR scanning) - CDN. If offline, download and bundle. -->
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+
+  <script>
+    // Minimal local DB mapping QR payload to item metadata and overlay image.
+    const ITEM_DB = {
+      "item:shirt:001":{
+        title:"Navy Vintage Tee",
+        size:"M",
+        brand:"LabelCo",
+        info:"Vintage cut, 100% cotton. Machine wash cold.",
+        overlay:"/overlays/navy_tee.png",
+        recs:["khaki_chinos","white_sneakers"]
+      },
+      "item:jacket:002":{
+        title:"Utility Jacket",
+        size:"L",
+        brand:"FieldWorks",
+        info:"Lightweight, water-resistant. Recommend layering.",
+        overlay:"/overlays/utility_jacket.png",
+        recs:["black_boots","denim_jeans"]
+      }
+    };
+
+    // Small helper to show recs (IDs) as friendly text.
+    const RECS_FRIENDLY = {"khaki_chinos":"Khaki chinos","white_sneakers":"White sneakers","black_boots":"Black boots","denim_jeans":"Denim jeans"};
+
+    // Elements
+    const video = document.getElementById('camera');
+    const canvas = document.getElementById('videoCanvas');
+    const ctx = canvas.getContext('2d');
+    const overlayImg = document.getElementById('overlay');
+    const status = document.getElementById('status');
+    const infoPanel = document.getElementById('infoPanel');
+    const itemTitle = document.getElementById('itemTitle');
+    const itemMeta = document.getElementById('itemMeta');
+    const recs = document.getElementById('recs');
+
+    const portraitInfo = document.getElementById('portraitInfo');
+    const pTitle = document.getElementById('pTitle');
+    const pMeta = document.getElementById('pMeta');
+    const pRecs = document.getElementById('pRecs');
+
+    let currentItem = null;
+    let shouldMirror = true; // for front camera mirroring
+
+    async function startCamera(){
+      try{
+        const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'},audio:false});
+        video.srcObject = stream;
+        await video.play();
+        // size the canvas to video
+        canvas.width = video.videoWidth || 640;
+        canvas.height = video.videoHeight || 480;
+      }catch(e){
+        alert('Camera access denied or unavailable. Serve over HTTPS and allow camera permission.');
+        console.error(e);
+      }
+    }
+
+    // simple function to scan current video frame for QR with jsQR
+    function scanFrameForQR(){
+      if(video.readyState !== video.HAVE_ENOUGH_DATA) return null;
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      ctx.drawImage(video,0,0,canvas.width,canvas.height);
+      const imageData = ctx.getImageData(0,0,canvas.width,canvas.height);
+      const code = jsQR(imageData.data, imageData.width, imageData.height, {inversionAttempts:'attemptBoth'});
+      return code ? code.data : null;
+    }
+
+    // Polling scanner when user taps Scan
+    let scanning = false;
+    document.getElementById('scanBtn').addEventListener('click', ()=>{
+      if(scanning) { scanning=false; document.getElementById('scanBtn').textContent='Scan QR'; return; }
+      scanning=true; document.getElementById('scanBtn').textContent='Stop scanning';
+      const loop = ()=>{
+        if(!scanning) return;
+        const q = scanFrameForQR();
+        if(q){
+          scanning=false; document.getElementById('scanBtn').textContent='Scan QR';
+          handleScan(q);
+        } else {
+          requestAnimationFrame(loop);
+        }
+      };
+      loop();
+    });
+
+    document.getElementById('toggleMirror').addEventListener('click', ()=>{shouldMirror = !shouldMirror; if(shouldMirror) video.style.transform='scaleX(-1)'; else video.style.transform='scaleX(1)'});
+
+    function handleScan(payload){
+      status.textContent = 'Scanned: '+payload;
+      const item = ITEM_DB[payload];
+      if(!item){
+        alert('Unknown item code: '+payload+' (Add it to ITEM_DB in the prototype code)');
+        return;
+      }
+      currentItem = item;
+      // set overlay image if exists (use relative path or base64 in prod)
+      overlayImg.src = item.overlay; overlayImg.style.display='block';
+
+      // populate info panel
+      itemTitle.textContent = item.title;
+      itemMeta.textContent = item.brand + ' • ' + item.size + '\n' + item.info;
+      recs.innerHTML = '';
+      item.recs.forEach(rid=>{ const d = document.createElement('div'); d.textContent = (RECS_FRIENDLY[rid]||rid); recs.appendChild(d); });
+      infoPanel.style.display='block';
+
+      // update portrait info too
+      pTitle.textContent = item.title;
+      pMeta.textContent = item.brand + ' — ' + item.size + '\n' + item.info;
+      pRecs.innerHTML = '<strong>Recommendations</strong><br>' + item.recs.map(r=>RECS_FRIENDLY[r]||r).join(', ');
+    }
+
+    // Orientation handling: when device rotates to portrait, hide AR view and show portrait info. The examples
+    // below use Screen.orientation but also attach 'resize' fallback for browsers that don't support it.
+    const modeText = document.getElementById('modeText');
+    function updateMode(){
+      const isPortrait = window.matchMedia('(orientation: portrait)').matches;
+      if(isPortrait){
+        // info mode
+        modeText.textContent = 'Info';
+        document.getElementById('view').style.display='none';
+        portraitInfo.style.display='block';
+      } else {
+        modeText.textContent = 'AR try-on';
+        document.getElementById('view').style.display='flex';
+        portraitInfo.style.display='none';
+      }
+    }
+    window.addEventListener('orientationchange', updateMode);
+    window.addEventListener('resize', updateMode);
+
+    // init
+    startCamera().then(()=>{
+      updateMode();
+    });
+
+    // UI improvement ideas (left as comments for you to implement):
+    // 1) Allow user to pinch-zoom / drag overlay image (use touch events) so they can position the apparel roughly over their torso.
+    // 2) Replace the static overlay with a 3D glTF model and use three.js + model-viewer for nicer fit and rotation.
+    // 3) Add BodyPix / MoveNet via TensorFlow.js or MediaPipe to auto-fit overlays to users' body rotation (more effort but impressive).
+    // 4) Use NFC tags (if available) for single-touch scanning instead of QR codes.
+
+  </script>
+</body>
+</html>
